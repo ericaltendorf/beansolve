@@ -1,21 +1,12 @@
 using JuMP, HiGHS, Test
 
 ######################################################################
-# Infra
+# Domain model
 
 # Use this to declare struct fields which are solvable for
 struct SolveVar{T}
 	v::Union{T, JuMP.VariableRef}
 end
-
-# Use this to mark instance fields as to be solved for
-function unk(model::Model)
-	@variable(model, x)
-	return SolveVar{Float64}(x)
-end
-
-######################################################################
-# Domain
 
 struct Amt
 	number::SolveVar{Float64}
@@ -32,43 +23,88 @@ struct Tx
 	postings::Vector{Posting}
 end
 
+function validate_tx(tx::Tx)
+	@assert length(tx.postings) > 0
+	@assert all([p.cost.asset == p.price.asset for p in tx.postings
+		if p.cost !== nothing && p.price !== nothing])
+end
+
 function posting_value(p::Posting, numeraire::String)
 	if p.units.asset == numeraire
 		return p.units.number.v
+	elseif p.price !== nothing && p.price.asset == numeraire
+		return p.units.number.v * p.price.number.v
+	elseif p.cost !== nothing && p.cost.asset == numeraire
+		return p.units.number.v * p.cost.number.v
 	else
-		return 0.0
+		throw(ErrorException("Can't compute value of posting: $p"))
 	end
 end
 
-function balance_by_asset(tx::Tx, asset::String)
-	postings = [p for p in tx.postings if p.units.asset == asset]
-	if length(postings) == 0
-		return 0
-	else
-		return sum([posting_value(p, asset) for p in postings])
-	end
+function balance(tx::Tx, numeraire::String)
+	return sum([posting_value(p, numeraire) for p in tx.postings])
 end
 
 function set_constraints(model::Model)
-	@constraint(model, balance_by_asset(tx, "USD") == 0)
+	@constraint(model, balance(tx, "USD") == 0)
+end
+
+######################################################################
+# Setup code for examples
+
+function reset_model()
+	model = Model(HiGHS.Optimizer)
+	return model
+end
+
+function run(tx::Tx, model::Model)
+	validate_tx(tx)
+	set_constraints(model)
+	optimize!(model)
+end
+
+# Create a "parameter" float (i.e. one with supplied, fixed value)
+function par(val::Float64)
+	return SolveVar{Float64}(val)
+end
+
+# Create a "variable" float (i.e., one the model will solve for)
+function var(model::Model)
+	@variable(model, x)
+	return SolveVar{Float64}(x)
 end
 
 ######################################################################
 # Examples
 
-model = Model(HiGHS.Optimizer)
-
-# Two known transactions and one variable to solve for
-expect_n5 = unk(model)
+# Infer units of an underspecified posting
+model = reset_model()
+missing_leg = var(model)
 tx = Tx([
-	Posting(Amt(SolveVar{Float64}(10.0), "USD"), nothing, nothing
-	),
-	Posting(Amt(SolveVar{Float64}(-5.0), "USD"), nothing, nothing
-	),
-	Posting(Amt(expect_n5, "USD"), nothing, nothing
-	)
+	Posting(Amt(par(10.0), "USD"), nothing, nothing),
+	Posting(Amt(par(-5.0), "USD"), nothing, nothing),
+	Posting(Amt(missing_leg, "USD"), nothing, nothing),
 ])
-set_constraints(model)
-optimize!(model)
+run(tx, model)
+@test value(missing_leg.v) == -5.0
 
-@test value(expect_n5.v) == -5.0
+# Infer price (exchange rate)
+model = reset_model()
+exchange_rate = var(model)
+tx = Tx([
+	Posting(Amt(par(-10.0), "USD"), nothing, nothing),
+	Posting(Amt(par(12.5), "EUR"), nothing, Amt(exchange_rate, "USD"))
+])
+run(tx, model)
+@test value(exchange_rate.v) == 0.8
+
+# Infer capital gains
+model = reset_model()
+cap_gains = var(model)
+tx = Tx([
+	Posting(Amt(par(1200.0), "USD"), nothing, nothing),
+	Posting(Amt(par(-10.0), "HOOL"), Amt(par(100.0), "USD"), nothing),
+	Posting(Amt(cap_gains, "USD"), nothing, nothing),
+])
+run(tx, model)
+@test value(cap_gains.v) == -200.0
